@@ -481,6 +481,95 @@ def next_scheduled_ist(now):
     return candidate
 
 
+def _inline_md(s):
+    """Escape HTML, then apply bold / italic / links to one line of markdown."""
+    s = html.escape(s)
+    s = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
+    s = re.sub(r"__(.+?)__", r"<b>\1</b>", s)
+    s = re.sub(r"(?<![\*\w])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![\*\w])", r"<i>\1</i>", s)
+    s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
+    s = re.sub(r"(?<![\"'>=])(https?://[^\s<)\]]+)", r'<a href="\1">\1</a>', s)
+    return s
+
+
+def md_to_html(text):
+    """Small markdown -> HTML converter (headings, bold, lists, tables, rules)."""
+    out, list_tag, table_rows = [], None, []
+
+    def close_list():
+        nonlocal list_tag
+        if list_tag:
+            out.append(f"</{list_tag}>")
+            list_tag = None
+
+    def flush_table():
+        nonlocal table_rows
+        if table_rows:
+            rows = []
+            for i, cells in enumerate(table_rows):
+                tag = "th" if i == 0 else "td"
+                rows.append("<tr>" + "".join(
+                    f'<{tag} style="border:1px solid #ccc;padding:4px 8px;text-align:left">'
+                    f"{_inline_md(c)}</{tag}>" for c in cells) + "</tr>")
+            out.append('<table style="border-collapse:collapse;margin:8px 0">' + "".join(rows) + "</table>")
+            table_rows = []
+
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        stripped = line.strip()
+        if stripped.startswith("|") and stripped.endswith("|") and stripped.count("|") >= 2:
+            close_list()
+            if re.fullmatch(r"\|[\s:\-|]+\|", stripped):
+                continue  # table separator row
+            table_rows.append([c.strip() for c in stripped.strip("|").split("|")])
+            continue
+        flush_table()
+        if not stripped:
+            close_list()
+            continue
+        m = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+        if m:
+            close_list()
+            level = min(len(m.group(1)) + 2, 6)
+            out.append(f"<h{level} style=\"margin:14px 0 4px\">{_inline_md(m.group(2))}</h{level}>")
+            continue
+        if re.fullmatch(r"[-*_]{3,}", stripped):
+            close_list()
+            out.append("<hr>")
+            continue
+        m = re.match(r"^[-*•]\s+(.*)$", stripped)
+        if m:
+            if list_tag != "ul":
+                close_list()
+                out.append("<ul>")
+                list_tag = "ul"
+            out.append(f"<li>{_inline_md(m.group(1))}</li>")
+            continue
+        m = re.match(r"^\d+[.)]\s+(.*)$", stripped)
+        if m:
+            if list_tag != "ol":
+                close_list()
+                out.append("<ol>")
+                list_tag = "ol"
+            out.append(f"<li>{_inline_md(m.group(1))}</li>")
+            continue
+        close_list()
+        out.append(f'<p style="margin:6px 0">{_inline_md(stripped)}</p>')
+    close_list()
+    flush_table()
+    return "\n".join(out)
+
+
+def md_to_plain(text):
+    """Remove markdown markers for the plain-text email part."""
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"__(.+?)__", r"\1", text)
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*[-*]\s+", "• ", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*\|?[\s:\-|]{5,}\|?\s*$\n?", "", text, flags=re.MULTILINE)
+    return text
+
+
 def make_report(articles, analysis):
     now = now_ist()
     next_run = next_scheduled_ist(now)
@@ -499,7 +588,7 @@ def make_report(articles, analysis):
         "",
         "CONSOLIDATED GLOBAL + INDIAN NEWS ANALYSIS",
         "-" * 60,
-        analysis,
+        md_to_plain(analysis),
         "",
         "SUPPORTING ARTICLE INDEX (raw fetched headlines; AI analysis may consolidate related stories)",
     ]
@@ -544,8 +633,7 @@ def make_report(articles, analysis):
         '<p>Related coverage should be consolidated into one event report, while distinct events remain separate. '
         'Each event should include global and Indian impacts, affected sectors, stock-by-stock reasoning, source links, '
         'validation, confidence and confirmation/invalidation conditions.</p>',
-        '<pre style="white-space:pre-wrap;font-family:Arial,sans-serif">'
-        + html.escape(analysis) + '</pre>',
+        '<div style="font-family:Arial,sans-serif">' + md_to_html(analysis) + '</div>',
         '<h3>2. Supporting Article Index — Official / Primary Publisher Class</h3><ul>'
         + ''.join(article_html(a) for a in groups['Tier 1 — Official / Primary']) + '</ul>',
         '<h3>3. Supporting Article Index — Established Reporting</h3><ul>'
