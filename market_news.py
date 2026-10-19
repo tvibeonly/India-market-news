@@ -15,8 +15,8 @@ from difflib import SequenceMatcher
 
 import requests
 
-# Google News RSS -> AI analysis (local Ollama by default) -> email -> seen-state.
-# Configure email credentials through GitHub Actions Secrets.
+# Google News RSS -> AI analysis (Hugging Face model chain by default) -> email -> seen-state.
+# Configure email credentials and HF_TOKEN through GitHub Actions Secrets.
 IST = ZoneInfo("Asia/Kolkata")
 RSS_URL = "https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
 
@@ -55,8 +55,8 @@ SEARCHES = [
 ]
 
 MAX_ARTICLES = int(os.getenv("MAX_ARTICLES", "60"))
-# Smaller input sets improve instruction-following on compact local models.
-MAX_AI_ARTICLES = int(os.getenv("MAX_AI_ARTICLES", "20"))
+# Large hosted models handle more headlines than the old 3B local model could.
+MAX_AI_ARTICLES = int(os.getenv("MAX_AI_ARTICLES", "30"))
 STATE_FILE = os.getenv("STATE_FILE", "seen_news.json")
 HF_URL = "https://router.huggingface.co/v1/chat/completions"
 # The script needs the complete OpenAI-compatible endpoint, not just the base URL.
@@ -65,6 +65,16 @@ OLLAMA_URL = os.getenv(
     "http://127.0.0.1:11434/v1/chat/completions"
 ).rstrip("/")
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "25"))
+
+# Hugging Face model chain, best first. Each is tried in order until one answers.
+# Override with the HF_MODELS repo variable (comma-separated) or a single HF_MODEL.
+DEFAULT_HF_MODELS = [
+    "deepseek-ai/DeepSeek-V4-Pro-0813",   # flagship reasoning model
+    "moonshotai/Kimi-K3",                  # strong long-context reasoning
+    "zai-org/GLM-5.3",                     # strong general/analytical model
+    "Qwen/Qwen3.8-27B",                    # smaller, fast, dependable
+    "deepseek-ai/DeepSeek-V4.1-Flash",     # cheap fast fallback
+]
 
 TIER1 = {
     "nse", "nse india", "national stock exchange", "bse", "bse india",
@@ -283,31 +293,60 @@ def build_analysis_prompt(articles):
     )
 
 
+def hf_model_chain():
+    """Ordered list of Hugging Face models to try (best first)."""
+    raw = (os.getenv("HF_MODELS") or os.getenv("HF_MODEL") or "").strip()
+    models = [m.strip() for m in raw.split(",") if m.strip()] or list(DEFAULT_HF_MODELS)
+    # ':fastest' lets the router pick a live provider; keep user-supplied suffixes untouched.
+    return [m if ":" in m else f"{m}:fastest" for m in models]
+
+
+def clean_model_output(text):
+    """Strip reasoning-model <think> blocks so only the report is emailed."""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"^.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    return text.strip()
+
+
+def call_chat(url, headers, payload):
+    response = requests.post(
+        url,
+        headers=headers,
+        json=payload,
+        timeout=int(os.getenv("AI_TIMEOUT", "300")),
+    )
+    response.raise_for_status()
+    content = clean_model_output(response.json()["choices"][0]["message"]["content"] or "")
+    if not content:
+        raise ValueError("The AI provider returned an empty response")
+    return content
+
+
 def ai_analysis(articles):
-    """Use local Ollama by default; Hugging Face remains an optional provider."""
-    provider = (os.getenv("AI_PROVIDER") or "ollama").strip().lower()
+    """Hugging Face model chain by default; local Ollama if AI_PROVIDER=ollama."""
+    default_provider = "huggingface" if os.getenv("HF_TOKEN", "").strip() else "ollama"
+    provider = (os.getenv("AI_PROVIDER") or default_provider).strip().lower()
     prompt = build_analysis_prompt(articles)
-    payload = {
+    base_payload = {
         "messages": [
             {
                 "role": "system",
                 "content": (
                     "You are a careful global macro and Indian equity-market news analyst. "
                     "Consolidate duplicate coverage into event-level reports, preserve all supporting links, "
-                    "map only credible stock exposures, and explicitly label uncertainty."
+                    "map only credible stock exposures, and explicitly label uncertainty. "
+                    "Output only the final report, with no preamble or reasoning transcript."
                 ),
             },
             {"role": "user", "content": prompt},
         ],
-        "max_tokens": int(os.getenv("AI_MAX_TOKENS", os.getenv("HF_MAX_TOKENS", "5000"))),
+        "max_tokens": int(os.getenv("AI_MAX_TOKENS", os.getenv("HF_MAX_TOKENS", "6000"))),
         "temperature": 0.15,
     }
 
     if provider == "ollama":
         model = (os.getenv("OLLAMA_MODEL") or "qwen2.5:3b").strip()
-        url = OLLAMA_URL
-        headers = {"Content-Type": "application/json"}
-        payload["model"] = model
+        attempts = [(OLLAMA_URL, {"Content-Type": "application/json"}, model)]
     elif provider in ("huggingface", "hf"):
         token = os.getenv("HF_TOKEN", "").strip()
         if not token:
@@ -315,59 +354,49 @@ def ai_analysis(articles):
                 "AI analysis skipped: HF_TOKEN is not configured for the Hugging Face provider. "
                 "Article links are included below."
             )
-        model = (os.getenv("HF_MODEL") or "Qwen/Qwen2.5-7B-Instruct:cheapest").strip()
-        url = HF_URL
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
-        payload["model"] = model
+        attempts = [(HF_URL, headers, m) for m in hf_model_chain()]
     else:
         return (
             f"AI analysis skipped: unsupported AI_PROVIDER '{provider}'. "
-            "Use 'ollama' or 'huggingface'. Article links are included below."
+            "Use 'huggingface' or 'ollama'. Article links are included below."
         )
 
-    try:
-        print(f"AI provider={provider}; model={model}; endpoint={url}")
-        response = requests.post(
-            url,
-            headers=headers,
-            json=payload,
-            timeout=int(os.getenv("AI_TIMEOUT", "300")),
-        )
-        response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"].strip()
-        if not content:
-            raise ValueError("The AI provider returned an empty response")
-        return content
-    except requests.HTTPError as exc:
-        status = exc.response.status_code if exc.response is not None else "unknown"
+    errors = []
+    for url, headers, model in attempts:
+        payload = dict(base_payload, model=model)
         try:
-            detail = (exc.response.text or "").strip()[:900] if exc.response is not None else ""
-        except Exception:
-            detail = ""
-        if provider == "ollama":
-            help_text = (
-                "Check that Ollama is running, the model was downloaded, and OLLAMA_URL/OLLAMA_MODEL are correct."
-            )
-        else:
-            help_text = (
-                "Check HF_TOKEN permissions, model/provider availability, Inference Providers credits/quota, "
-                "and HF_MODEL."
-            )
-        return (
-            f"AI analysis failed for provider '{provider}', model '{model}' (HTTP {status}).\n"
-            f"Provider response: {detail or 'No response detail supplied.'}\n"
-            f"{help_text}"
+            print(f"AI provider={provider}; model={model}; endpoint={url}", flush=True)
+            content = call_chat(url, headers, payload)
+            print(f"AI analysis succeeded with model {model}.", flush=True)
+            return f"[Model: {model}]\n\n{content}"
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else "unknown"
+            try:
+                detail = (exc.response.text or "").strip()[:300] if exc.response is not None else ""
+            except Exception:
+                detail = ""
+            errors.append(f"- {model}: HTTP {status} {detail}")
+            print(f"Model {model} failed (HTTP {status}); trying next.", flush=True)
+        except Exception as exc:
+            errors.append(f"- {model}: {type(exc).__name__}: {exc}")
+            print(f"Model {model} failed ({type(exc).__name__}); trying next.", flush=True)
+
+    if provider == "ollama":
+        help_text = "Check that Ollama is running, the model was downloaded, and OLLAMA_URL/OLLAMA_MODEL are correct."
+    else:
+        help_text = (
+            "Check HF_TOKEN permissions (Inference Providers), credits/quota, and the HF_MODELS list. "
+            "Model availability changes; see https://router.huggingface.co/v1/models"
         )
-    except Exception as exc:
-        return (
-            f"AI analysis failed for provider '{provider}', model '{model}': "
-            f"{type(exc).__name__}: {exc}.\n"
-            "Headlines and links are still included. Check provider availability, model download, network access, "
-            "and the configured timeout."
-        )
+    return (
+        f"AI analysis failed for provider '{provider}'. Models tried:\n"
+        + "\n".join(errors)
+        + f"\n{help_text}\nHeadlines and links are still included below."
+    )
 
 
 def grouped_articles(articles):
