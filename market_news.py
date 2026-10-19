@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import json
 import hashlib
 import smtplib
@@ -55,8 +56,8 @@ SEARCHES = [
 ]
 
 MAX_ARTICLES = int(os.getenv("MAX_ARTICLES", "60"))
-# Large hosted models handle more headlines than the old 3B local model could.
-MAX_AI_ARTICLES = int(os.getenv("MAX_AI_ARTICLES", "30"))
+# Kept modest so one request fits Groq's free-tier tokens-per-minute limit.
+MAX_AI_ARTICLES = int(os.getenv("MAX_AI_ARTICLES", "15"))
 STATE_FILE = os.getenv("STATE_FILE", "seen_news.json")
 HF_URL = "https://router.huggingface.co/v1/chat/completions"
 # The script needs the complete OpenAI-compatible endpoint, not just the base URL.
@@ -74,6 +75,16 @@ DEFAULT_HF_MODELS = [
     "zai-org/GLM-5.3",                     # strong general/analytical model
     "Qwen/Qwen3.8-27B",                    # smaller, fast, dependable
     "deepseek-ai/DeepSeek-V4.1-Flash",     # cheap fast fallback
+]
+
+# Groq (free tier, OpenAI-compatible). Models tried best first; unavailable ones are skipped.
+# Override with the GROQ_MODELS repo variable (comma-separated).
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+DEFAULT_GROQ_MODELS = [
+    "openai/gpt-oss-120b",
+    "qwen/qwen3-32b",
+    "llama-3.3-70b-versatile",
+    "openai/gpt-oss-20b",
 ]
 
 TIER1 = {
@@ -309,12 +320,24 @@ def clean_model_output(text):
 
 
 def call_chat(url, headers, payload):
-    response = requests.post(
-        url,
-        headers=headers,
-        json=payload,
-        timeout=int(os.getenv("AI_TIMEOUT", "300")),
-    )
+    # Retry on rate limits (HTTP 429), waiting as long as the provider asks.
+    for attempt in range(3):
+        response = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=int(os.getenv("AI_TIMEOUT", "300")),
+        )
+        if response.status_code == 429 and attempt < 2:
+            try:
+                wait = float(response.headers.get("retry-after", "30"))
+            except ValueError:
+                wait = 30.0
+            wait = min(max(wait, 5.0), 90.0)
+            print(f"Rate limited (429); waiting {wait:.0f}s then retrying.", flush=True)
+            time.sleep(wait)
+            continue
+        break
     response.raise_for_status()
     content = clean_model_output(response.json()["choices"][0]["message"]["content"] or "")
     if not content:
@@ -324,7 +347,12 @@ def call_chat(url, headers, payload):
 
 def ai_analysis(articles):
     """Hugging Face model chain by default; local Ollama if AI_PROVIDER=ollama."""
-    default_provider = "huggingface" if os.getenv("HF_TOKEN", "").strip() else "ollama"
+    if os.getenv("GROQ_API_KEY", "").strip():
+        default_provider = "groq"
+    elif os.getenv("HF_TOKEN", "").strip():
+        default_provider = "huggingface"
+    else:
+        default_provider = "ollama"
     provider = (os.getenv("AI_PROVIDER") or default_provider).strip().lower()
     prompt = build_analysis_prompt(articles)
     base_payload = {
@@ -344,7 +372,18 @@ def ai_analysis(articles):
         "temperature": 0.15,
     }
 
-    if provider == "ollama":
+    if provider == "groq":
+        key = os.getenv("GROQ_API_KEY", "").strip()
+        if not key:
+            return (
+                "AI analysis skipped: GROQ_API_KEY is not configured. "
+                "Article links are included below."
+            )
+        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        raw = (os.getenv("GROQ_MODELS") or os.getenv("GROQ_MODEL") or "").strip()
+        groq_models = [m.strip() for m in raw.split(",") if m.strip()] or list(DEFAULT_GROQ_MODELS)
+        attempts = [(GROQ_URL, headers, m) for m in groq_models]
+    elif provider == "ollama":
         model = (os.getenv("OLLAMA_MODEL") or "qwen2.5:3b").strip()
         attempts = [(OLLAMA_URL, {"Content-Type": "application/json"}, model)]
     elif provider in ("huggingface", "hf"):
@@ -368,6 +407,12 @@ def ai_analysis(articles):
     errors = []
     for url, headers, model in attempts:
         payload = dict(base_payload, model=model)
+        if provider == "groq":
+            # Keep reasoning short/hidden so the token budget goes to the report.
+            if "gpt-oss" in model:
+                payload["reasoning_effort"] = "low"
+            elif "qwen3" in model:
+                payload["reasoning_format"] = "hidden"
         try:
             print(f"AI provider={provider}; model={model}; endpoint={url}", flush=True)
             content = call_chat(url, headers, payload)
@@ -385,7 +430,12 @@ def ai_analysis(articles):
             errors.append(f"- {model}: {type(exc).__name__}: {exc}")
             print(f"Model {model} failed ({type(exc).__name__}); trying next.", flush=True)
 
-    if provider == "ollama":
+    if provider == "groq":
+        help_text = (
+            "Check GROQ_API_KEY, daily/per-minute limits on console.groq.com (Limits page), "
+            "and the GROQ_MODELS list; model names change over time."
+        )
+    elif provider == "ollama":
         help_text = "Check that Ollama is running, the model was downloaded, and OLLAMA_URL/OLLAMA_MODEL are correct."
     else:
         help_text = (
@@ -424,10 +474,10 @@ def article_html(a):
 
 
 def next_scheduled_ist(now):
-    # Workflow runs at minute 17 UTC, which is minute 47 IST.
-    candidate = now.replace(minute=47, second=0, microsecond=0)
+    # Workflow runs once a day at 02:30 UTC = 08:00 IST (before the 09:15 market open).
+    candidate = now.replace(hour=8, minute=0, second=0, microsecond=0)
     if candidate <= now:
-        candidate += timedelta(hours=1)
+        candidate += timedelta(days=1)
     return candidate
 
 
