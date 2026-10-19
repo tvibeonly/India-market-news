@@ -1,82 +1,87 @@
+
 name: Hourly Indian Market News
 
 on:
   schedule:
-    # Run at minute 17 of every hour (UTC); avoids the busiest top-of-hour.
     - cron: "17 * * * *"
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: hourly-market-news
+  group: hourly-indian-market-news
   cancel-in-progress: false
 
 jobs:
-  send-news:
+  market-news:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.ref_name }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
-      - name: Install dependencies
-        run: python -m pip install --upgrade pip requests
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install requests
+          fi
 
-      - name: Cache Ollama model
-        uses: actions/cache@v4
-        with:
-          path: ~/.ollama/models
-          key: ollama-qwen2.5-3b-v1
-
-      - name: Install Ollama, analyze news, and email report
-        env:
-          AI_PROVIDER: ollama
-          OLLAMA_MODEL: qwen2.5:3b
-          OLLAMA_URL: http://localhost:11434/v1/chat/completions
-          MAX_AI_ARTICLES: "20"
-          AI_MAX_TOKENS: "5000"
-          AI_TIMEOUT: "300"
-          SMTP_HOST: ${{ vars.SMTP_HOST }}
-          SMTP_PORT: ${{ vars.SMTP_PORT }}
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
-          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+      - name: Install Ollama
         run: |
           curl -fsSL https://ollama.com/install.sh | sh
-          # Use the runner user's model directory so the GitHub Actions cache is effective.
-          sudo systemctl stop ollama 2>/dev/null || true
-          export OLLAMA_MODELS="$HOME/.ollama/models"
-          nohup ollama serve > "$RUNNER_TEMP/ollama.log" 2>&1 &
-          for i in {1..30}; do
-            if curl -fsS http://localhost:11434/api/tags >/dev/null; then
-              break
+
+      - name: Start Ollama
+        run: |
+          ollama serve > /tmp/ollama.log 2>&1 &
+          for i in {1..60}; do
+            if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null; then
+              echo "Ollama is ready."
+              exit 0
             fi
             sleep 2
           done
-          if ! curl -fsS http://localhost:11434/api/tags >/dev/null; then
-            cat "$RUNNER_TEMP/ollama.log" || true
-            echo "Ollama did not start successfully."
-            exit 1
-          fi
-          ollama pull qwen2.5:3b
-          python market_news.py
+          echo "Ollama failed to start:"
+          cat /tmp/ollama.log
+          exit 1
 
-      - name: Save seen-article history
-        if: success()
+      - name: Download AI model
         run: |
-          if [ -n "$(git status --porcelain -- seen_news.json)" ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add seen_news.json
-            git commit -m "Update seen market news"
-            git push
-          fi
+          ollama pull qwen2.5:3b
+
+      - name: Test Ollama API
+        run: |
+          curl --fail --show-error --silent \
+            http://127.0.0.1:11434/api/chat \
+            -H "Content-Type: application/json" \
+            -d '{
+              "model": "qwen2.5:3b",
+              "messages": [
+                {
+                  "role": "user",
+                  "content": "Reply with exactly: AI working"
+                }
+              ],
+              "stream": false
+            }'
+
+      - name: Run market news script
+        env:
+          AI_PROVIDER: ollama
+          AI_MODEL: qwen2.5:3b
+          OLLAMA_BASE_URL: http://127.0.0.1:11434
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python market_news.py
