@@ -62,7 +62,8 @@ MAX_ARTICLES = int(os.getenv("MAX_ARTICLES", "80"))
 MAX_AI_ARTICLES = int(os.getenv("MAX_AI_ARTICLES", "50"))
 STATE_FILE = os.getenv("STATE_FILE", "seen_news.json")
 HF_URL = "https://router.huggingface.co/v1/chat/completions"
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/v1/chat/completions").rstrip("/")
+OLLAMA_URL = os.getenv("OLLAMA_URL","http://127.0.0.1:11434/v1/chat/completions").rstrip("/")
+# OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/v1/chat/completions").rstrip("/")
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "25"))
 
 TIER1 = {
