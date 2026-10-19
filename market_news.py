@@ -15,13 +15,12 @@ from difflib import SequenceMatcher
 
 import requests
 
-# Existing workflow retained: Google News RSS -> AI analysis -> email -> seen-state.
-# Configure secrets through environment variables / GitHub Actions Secrets.
+# Google News RSS -> AI analysis (local Ollama by default) -> email -> seen-state.
+# Configure email credentials through GitHub Actions Secrets.
 IST = ZoneInfo("Asia/Kolkata")
 RSS_URL = "https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
 
 SEARCHES = [
-    # India: markets, official policy, filings and sector/company catalysts
     'Nifty 50 Bank Nifty Nifty Financial Services India markets when:1d',
     'site:nseindia.com corporate announcements results India listed companies when:2d',
     'site:bseindia.com corporate announcements listed companies when:2d',
@@ -36,19 +35,16 @@ SEARCHES = [
     'India IT technology auto pharma FMCG infrastructure defence real estate stocks when:1d',
     'India inflation GDP PMI rupee bond yields FII DII budget trade policy when:1d',
     'India company earnings order win merger acquisition regulatory action stocks when:1d',
-    # Global macro, central banks and official statistics
     'Federal Reserve FOMC US inflation employment Treasury yields dollar markets when:1d',
     'site:bls.gov CPI employment site:bea.gov GDP PCE United States when:7d',
     'ECB Bank of England Bank of Japan China PBOC central bank decisions when:1d',
     'China economy stimulus manufacturing property trade tariffs markets when:1d',
     'IMF World Bank global growth financial stability sovereign debt when:7d',
-    # Global geopolitics, trade and energy
     'Middle East geopolitics oil shipping sanctions crude prices when:1d',
     'Russia Ukraine sanctions war trade global markets when:1d',
     'global tariffs trade restrictions export controls supply chain markets when:1d',
     'OPEC oil supply EIA inventories IEA energy markets when:1d',
     'global banking stress credit markets volatility currencies when:1d',
-    # Established business and financial reporting
     'Reuters global markets India stocks economy when:1d',
     'Bloomberg global markets central banks commodities when:1d',
     'Financial Times geopolitics trade economy markets when:1d',
@@ -58,12 +54,16 @@ SEARCHES = [
     'Economic Times Markets India stocks when:1d',
 ]
 
-MAX_ARTICLES = int(os.getenv("MAX_ARTICLES", "80"))
-MAX_AI_ARTICLES = int(os.getenv("MAX_AI_ARTICLES", "50"))
+MAX_ARTICLES = int(os.getenv("MAX_ARTICLES", "60"))
+# Smaller input sets improve instruction-following on compact local models.
+MAX_AI_ARTICLES = int(os.getenv("MAX_AI_ARTICLES", "20"))
 STATE_FILE = os.getenv("STATE_FILE", "seen_news.json")
 HF_URL = "https://router.huggingface.co/v1/chat/completions"
-OLLAMA_URL = os.getenv("OLLAMA_URL","http://127.0.0.1:11434/v1/chat/completions").rstrip("/")
-# OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/v1/chat/completions").rstrip("/")
+# The script needs the complete OpenAI-compatible endpoint, not just the base URL.
+OLLAMA_URL = os.getenv(
+    "OLLAMA_URL",
+    "http://127.0.0.1:11434/v1/chat/completions"
+).rstrip("/")
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "25"))
 
 TIER1 = {
@@ -128,7 +128,8 @@ def parse_published(pub_date):
 
 def fetch_articles(seen_ids):
     collected = {}
-    for query in SEARCHES:
+    for query_index, query in enumerate(SEARCHES, start=1):
+        print(f"Fetching RSS query {query_index}/{len(SEARCHES)}: {query}", flush=True)
         url = RSS_URL.format(query=quote_plus(query))
         try:
             response = requests.get(
@@ -180,6 +181,7 @@ def fetch_articles(seen_ids):
 
 def build_analysis_prompt(articles):
     selected = articles[:MAX_AI_ARTICLES]
+    print(f"Preparing AI analysis for {len(selected)} articles (from {len(articles)} fetched).", flush=True)
     headlines = "\n".join(
         f"{i}. Title: {a['title']} | Publisher: {a['source']} | "
         f"Publisher class: {a['source_class']} | Published (RSS metadata, IST): {a['published']} | "
@@ -188,10 +190,12 @@ def build_analysis_prompt(articles):
     )
 
     return (
-        "Prepare a global-and-Indian market-intelligence report for an intraday equity trader. "
+        "Prepare a concise, event-based global-and-Indian market-intelligence report for an intraday equity trader. "
+        "DO NOT write a general description of RSS feeds, publishers, or the types of companies appearing in the feed. "
+        "Analyse the underlying news events instead. If the supplied headlines do not contain enough event facts, "
+        "say so and put the item in the validation queue rather than producing a generic feed summary. "
         "You only have the supplied headlines and metadata; do not claim to have read full articles "
         "or checked live market prices unless the input explicitly supplies that evidence.\n\n"
-
         "CRITICAL CONSOLIDATION RULES:\n"
         "1. CONSOLIDATE related articles about the same underlying event into ONE news event/report. "
         "This includes multiple publishers reporting the same event, multiple headlines about the same "
@@ -208,17 +212,16 @@ def build_analysis_prompt(articles):
         "6. Headlines are not full articles. If the facts are insufficient, state 'Needs verification from "
         "the linked article or primary source'. Never claim the event is officially confirmed based only on "
         "a publisher name or RSS metadata.\n\n"
-
         "SOURCE VS EVENT CLASSIFICATION:\n"
         "Publisher source class (official / established reporting / other) is separate from event impact tier. "
         "For every event, classify impact as Tier 1 (potentially immediate/critical), Tier 2 (important), "
         "or Validation required (unverified/conflicting/insufficiently supported). Explain why.\n\n"
-
         "MANDATORY REPORT HEADER:\n"
         "1. Executive summary: top 3–5 consolidated developments, overall risk tone, and most important "
         "India/global cross-market transmission channels. Do not infer live market direction without data.\n"
         "2. News counts: number of supplied articles, number of consolidated events, and validation-required events.\n\n"
-
+        "OUTPUT LENGTH: Prefer the 5–10 most market-relevant distinct events. Do not give every RSS headline its own report. "
+        "If fewer than five events have adequate evidence, report fewer and explain the data gap. Keep each event focused.\n\n"
         "MANDATORY TEMPLATE FOR EACH CONSOLIDATED EVENT:\n"
         "NEWS IMPACT REPORT — Event [number]\n"
         "Canonical headline:\n"
@@ -247,7 +250,6 @@ def build_analysis_prompt(articles):
         "direction, entry, stop-loss or price target without adequate live data and explicit methodology.\n"
         "CONFIDENCE: Low/Medium/High with reason. When only headlines/metadata are supplied, default to Low or "
         "explain why a stronger confidence is justified by supplied evidence.\n\n"
-
         "AFTER INDIVIDUAL EVENTS, INCLUDE:\n"
         "A. CONSOLIDATED STOCK WATCHLIST — Indian stocks and global stocks, each listed once, showing the event IDs "
         "that affect it, combined directional assessment (bullish/bearish/mixed/uncertain), key catalysts and risks. "
@@ -257,7 +259,6 @@ def build_analysis_prompt(articles):
         "D. VALIDATION QUEUE — events requiring primary-source confirmation or more article detail.\n"
         "E. DATA QUALITY / SYSTEM LIMITATIONS — headlines not full articles, missing live data, unavailable timestamps, "
         "and other gaps.\n\n"
-
         "MARKET-MAPPING GUIDANCE (candidates only; never attach all of these automatically):\n"
         "India banks: HDFCBANK, ICICIBANK, SBIN, AXISBANK, KOTAKBANK. India IT: TCS, INFY, HCLTECH, WIPRO. "
         "India energy: RELIANCE, ONGC, OIL, IOC, BPCL, HPCL, IGL, GAIL. Metals: TATASTEEL, JSWSTEEL, HINDALCO, VEDL. "
@@ -265,13 +266,11 @@ def build_analysis_prompt(articles):
         "Infrastructure/capital goods: LT, ABB, SIEMENS. Verify ticker and exposure; select only relevant names.\n"
         "Global candidates when relevant: banks JPM, BAC, C, GS; technology MSFT, NVDA, AAPL, AMZN; energy XOM, CVX, SHEL; "
         "materials BHP, RIO, FCX. Verify the listing/exchange and company exposure where possible.\n\n"
-
         "GLOBAL-TO-INDIA TRANSMISSION: Assess relevant paths such as US inflation -> Fed expectations -> yields/USD -> "
         "foreign flows/USDINR -> Indian equities; oil supply shock -> crude/freight/inflation -> Indian energy and "
         "fuel-sensitive companies; China stimulus -> industrial demand/commodities -> metals; global credit stress -> "
         "risk aversion/funding -> financials. These are hypotheses, not predetermined outcomes. Consider surprise "
         "versus expectations and whether market pricing confirms the thesis.\n\n"
-
         "IMPORTANT SAFETY / QUALITY RULES:\n"
         "- Never fabricate current prices, price changes, volume, option-chain data, FII/DII flows, event times, "
         "article text, source URLs, corroboration, earnings impacts or stock exposure.\n"
@@ -309,7 +308,6 @@ def ai_analysis(articles):
         url = OLLAMA_URL
         headers = {"Content-Type": "application/json"}
         payload["model"] = model
-        # Ollama's OpenAI-compatible endpoint does not need an API token.
     elif provider in ("huggingface", "hf"):
         token = os.getenv("HF_TOKEN", "").strip()
         if not token:
@@ -331,6 +329,7 @@ def ai_analysis(articles):
         )
 
     try:
+        print(f"AI provider={provider}; model={model}; endpoint={url}")
         response = requests.post(
             url,
             headers=headers,
@@ -360,7 +359,7 @@ def ai_analysis(articles):
         return (
             f"AI analysis failed for provider '{provider}', model '{model}' (HTTP {status}).\n"
             f"Provider response: {detail or 'No response detail supplied.'}\n"
-            f"Headlines and links are still included. {help_text}"
+            f"{help_text}"
         )
     except Exception as exc:
         return (
@@ -396,7 +395,7 @@ def article_html(a):
 
 
 def next_scheduled_ist(now):
-    # Preserve the existing hourly schedule at minute 47 IST.
+    # Workflow runs at minute 17 UTC, which is minute 47 IST.
     candidate = now.replace(minute=47, second=0, microsecond=0)
     if candidate <= now:
         candidate += timedelta(hours=1)
@@ -451,7 +450,6 @@ def make_report(articles, analysis):
     ])
     plain = "\n".join(lines)
 
-    # HTML email keeps the analysis readable and includes clickable raw-source links.
     parts = [
         '<html><body style="font-family:Arial,sans-serif;line-height:1.45;color:#202124">',
         f'<h2>Global + India Market Intelligence | {now.strftime("%d %b %Y")} | '
@@ -525,8 +523,11 @@ def main():
     seen_ids = load_seen()
     articles = fetch_articles(seen_ids)
 
+    print(f"RSS collection complete: {len(articles)} unseen articles selected.", flush=True)
     if articles:
+        print("Starting AI event consolidation and impact analysis; this step may take several minutes.", flush=True)
         analysis = ai_analysis(articles)
+        print("AI analysis complete.", flush=True)
     else:
         analysis = (
             "No new unseen headlines found since the previous successful run. This does not mean there is no "
