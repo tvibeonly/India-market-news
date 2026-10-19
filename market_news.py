@@ -62,6 +62,7 @@ MAX_ARTICLES = int(os.getenv("MAX_ARTICLES", "80"))
 MAX_AI_ARTICLES = int(os.getenv("MAX_AI_ARTICLES", "50"))
 STATE_FILE = os.getenv("STATE_FILE", "seen_news.json")
 HF_URL = "https://router.huggingface.co/v1/chat/completions"
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/v1/chat/completions").rstrip("/")
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "25"))
 
 TIER1 = {
@@ -283,17 +284,10 @@ def build_analysis_prompt(articles):
 
 
 def ai_analysis(articles):
-    token = os.getenv("HF_TOKEN", "").strip()
-    if not token:
-        return (
-            "AI analysis skipped: HF_TOKEN is not configured. Article links are included below. "
-            "Set HF_TOKEN and optionally HF_MODEL to enable consolidated event analysis."
-        )
-
-    model = (os.getenv("HF_MODEL") or "openai/gpt-oss-120b:cheapest").strip()
+    """Use local Ollama by default; Hugging Face remains an optional provider."""
+    provider = (os.getenv("AI_PROVIDER") or "ollama").strip().lower()
     prompt = build_analysis_prompt(articles)
     payload = {
-        "model": model,
         "messages": [
             {
                 "role": "system",
@@ -305,38 +299,74 @@ def ai_analysis(articles):
             },
             {"role": "user", "content": prompt},
         ],
-        "max_tokens": int(os.getenv("HF_MAX_TOKENS", "10000")),
+        "max_tokens": int(os.getenv("AI_MAX_TOKENS", os.getenv("HF_MAX_TOKENS", "5000"))),
         "temperature": 0.15,
     }
 
+    if provider == "ollama":
+        model = (os.getenv("OLLAMA_MODEL") or "qwen2.5:3b").strip()
+        url = OLLAMA_URL
+        headers = {"Content-Type": "application/json"}
+        payload["model"] = model
+        # Ollama's OpenAI-compatible endpoint does not need an API token.
+    elif provider in ("huggingface", "hf"):
+        token = os.getenv("HF_TOKEN", "").strip()
+        if not token:
+            return (
+                "AI analysis skipped: HF_TOKEN is not configured for the Hugging Face provider. "
+                "Article links are included below."
+            )
+        model = (os.getenv("HF_MODEL") or "Qwen/Qwen2.5-7B-Instruct:cheapest").strip()
+        url = HF_URL
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+        payload["model"] = model
+    else:
+        return (
+            f"AI analysis skipped: unsupported AI_PROVIDER '{provider}'. "
+            "Use 'ollama' or 'huggingface'. Article links are included below."
+        )
+
     try:
         response = requests.post(
-            HF_URL,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
+            url,
+            headers=headers,
             json=payload,
-            timeout=int(os.getenv("AI_TIMEOUT", "120")),
+            timeout=int(os.getenv("AI_TIMEOUT", "300")),
         )
         response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"].strip()
+        content = response.json()["choices"][0]["message"]["content"].strip()
+        if not content:
+            raise ValueError("The AI provider returned an empty response")
+        return content
     except requests.HTTPError as exc:
         status = exc.response.status_code if exc.response is not None else "unknown"
         try:
             detail = (exc.response.text or "").strip()[:900] if exc.response is not None else ""
         except Exception:
             detail = ""
+        if provider == "ollama":
+            help_text = (
+                "Check that Ollama is running, the model was downloaded, and OLLAMA_URL/OLLAMA_MODEL are correct."
+            )
+        else:
+            help_text = (
+                "Check HF_TOKEN permissions, model/provider availability, Inference Providers credits/quota, "
+                "and HF_MODEL."
+            )
         return (
-            f"AI analysis failed for model '{model}' (HTTP {status}).\n"
+            f"AI analysis failed for provider '{provider}', model '{model}' (HTTP {status}).\n"
             f"Provider response: {detail or 'No response detail supplied.'}\n"
-            "Headlines and links are still included. Check HF_TOKEN permissions, model/provider availability, "
-            "Inference Providers credits/quota, HF_MODEL and provider limits."
+            f"Headlines and links are still included. {help_text}"
         )
     except Exception as exc:
         return (
-            f"AI analysis failed for model '{model}': {type(exc).__name__}: {exc}.\n"
-            "Headlines and links are still included. Check network access, HF_TOKEN, model/provider availability and quota."
+            f"AI analysis failed for provider '{provider}', model '{model}': "
+            f"{type(exc).__name__}: {exc}.\n"
+            "Headlines and links are still included. Check provider availability, model download, network access, "
+            "and the configured timeout."
         )
 
 
