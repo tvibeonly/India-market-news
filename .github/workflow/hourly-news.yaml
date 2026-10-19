@@ -1,0 +1,54 @@
+name: Hourly Indian Market News
+
+on:
+  schedule:
+    # Run at minute 17 of every hour (UTC); avoids the busiest top-of-hour.
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hourly-market-news
+  cancel-in-progress: false
+
+jobs:
+  send-news:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip requests
+
+      - name: Fetch news, analyze, and email report
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_MODEL: ${{ vars.HF_MODEL }}
+          SMTP_HOST: ${{ vars.SMTP_HOST }}
+          SMTP_PORT: ${{ vars.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python market_news.py
+
+      - name: Save seen-article history
+        if: success()
+        run: |
+          if [ -n "$(git status --porcelain -- seen_news.json)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add seen_news.json
+            git commit -m "Update seen market news"
+            git push
+          fi
