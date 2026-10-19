@@ -1,8 +1,10 @@
-name: Hourly Indian Market News
+
+name: Daily Indian Market News
 
 on:
   schedule:
-    - cron: "17 * * * *"
+    # 02:30 UTC = 08:00 IST, once a day (GitHub may delay scheduled runs a bit)
+    - cron: "30 2 * * *"
   workflow_dispatch:
 
 # Needs write access so the run can commit seen_news.json (avoids repeated articles).
@@ -10,13 +12,13 @@ permissions:
   contents: write
 
 concurrency:
-  group: hourly-indian-market-news
+  group: daily-indian-market-news
   cancel-in-progress: false
 
 jobs:
   market-news:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
 
     steps:
       - name: Check out repository
@@ -38,15 +40,15 @@ jobs:
 
       - name: Run market news script
         env:
-          AI_PROVIDER: huggingface
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          # Optional repo variable: comma-separated model list, best first.
-          # Leave unset to use the built-in chain in market_news.py.
-          HF_MODELS: ${{ vars.HF_MODELS }}
-          AI_MAX_TOKENS: "6000"
+          AI_PROVIDER: groq
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          # Optional repo variable: comma-separated Groq models, best first.
+          GROQ_MODELS: ${{ vars.GROQ_MODELS }}
+          # Sized to fit Groq's free-tier tokens-per-minute limit.
+          AI_MAX_TOKENS: "3000"
           MAX_ARTICLES: "60"
-          MAX_AI_ARTICLES: "30"
-          AI_TIMEOUT: "300"
+          MAX_AI_ARTICLES: "15"
+          AI_TIMEOUT: "120"
           REQUEST_TIMEOUT: "20"
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
