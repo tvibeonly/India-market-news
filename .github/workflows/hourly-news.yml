@@ -5,8 +5,9 @@ on:
     - cron: "17 * * * *"
   workflow_dispatch:
 
+# Needs write access so the run can commit seen_news.json (avoids repeated articles).
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: hourly-indian-market-news
@@ -15,7 +16,7 @@ concurrency:
 jobs:
   market-news:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
 
     steps:
       - name: Check out repository
@@ -35,52 +36,16 @@ jobs:
             pip install requests
           fi
 
-      - name: Install Ollama
-        run: |
-          curl -fsSL https://ollama.com/install.sh | sh
-
-      - name: Start Ollama
-        run: |
-          nohup ollama serve > /tmp/ollama.log 2>&1 &
-          for i in {1..60}; do
-            if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null; then
-              echo "Ollama is ready."
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "Ollama failed to start:"
-          cat /tmp/ollama.log
-          exit 1
-
-      - name: Download AI model
-        run: |
-          ollama pull qwen2.5:3b
-
-      - name: Test Ollama API
-        run: |
-          curl --fail --show-error --silent \
-            http://127.0.0.1:11434/api/chat \
-            -H "Content-Type: application/json" \
-            -d '{
-              "model": "qwen2.5:3b",
-              "messages": [
-                {
-                  "role": "user",
-                  "content": "Reply with exactly: AI working"
-                }
-              ],
-              "stream": false
-            }'
-
       - name: Run market news script
         env:
-          AI_PROVIDER: ollama
-          OLLAMA_MODEL: qwen2.5:3b
-          OLLAMA_URL: http://127.0.0.1:11434/v1/chat/completions
-          AI_MAX_TOKENS: "5000"
+          AI_PROVIDER: huggingface
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          # Optional repo variable: comma-separated model list, best first.
+          # Leave unset to use the built-in chain in market_news.py.
+          HF_MODELS: ${{ vars.HF_MODELS }}
+          AI_MAX_TOKENS: "6000"
           MAX_ARTICLES: "60"
-          MAX_AI_ARTICLES: "20"
+          MAX_AI_ARTICLES: "30"
           AI_TIMEOUT: "300"
           REQUEST_TIMEOUT: "20"
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
@@ -89,3 +54,13 @@ jobs:
           SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: python market_news.py
+
+      - name: Commit seen-news state
+        run: |
+          if ! git diff --quiet -- seen_news.json; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add seen_news.json
+            git commit -m "Update seen news state"
+            git push
+          fi
